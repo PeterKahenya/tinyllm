@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import os
 
 @dataclass
 class TrainerParams:
@@ -22,6 +23,7 @@ class TrainerParams:
     optimizer: torch.optim.Optimizer
     gpu_id: int = 0
     save_every: int = 10
+    model_path: str
     loss_fn: nn.Module = field(default_factory=lambda: nn.CrossEntropyLoss())
 
 
@@ -58,7 +60,7 @@ class Trainer:
 
     def _save_checkpoint(self, epoch):
         ckp = self.model.state_dict()
-        PATH = "checkpoint.pt"
+        PATH = os.path.join(self.model_path, f"checkpoint_{epoch}.pt")
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
 
