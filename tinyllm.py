@@ -19,9 +19,11 @@ import regex as re
 import multiprocessing as mp
 import seaborn as sns
 from tqdm import tqdm
+import inspect
+import time
 
-pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
-pattern = re.compile(pattern)
+# this pattern is used to split the text into segments
+pattern = re.compile(r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s""")
 
 # count words
 def count_words(doc: Any) -> dict:
@@ -140,7 +142,7 @@ def bytes_to_unicode():
     return dict(zip(bs, cs))
             
 def plot_loss_curve(epochs,train_loss_values,test_loss_values):
-    sns.lineplot(x=epochs,y=train_loss_values)
+    sns.lineplot(x=epochs,y=train_loss_values, label='Loss Curve',color='purple')
     if test_loss_values:
         sns.lineplot(x=epochs,y=test_loss_values)
 
@@ -379,7 +381,7 @@ class TextEncoder:
         self.vocab = self._build_vocab()
         self.special_tokens_list = ['<|endofdoc|>']    
         self.special_tokens = {}
-        self.pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
+        self.pattern = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s"""
         self.pattern_compiled = re.compile(self.pattern)
         self.version = 0
         
@@ -525,6 +527,49 @@ class TextEncoder:
         return tokenizer
 
 
+# tokenize a document
+def tokenize(args: tuple[str, str]) -> np.ndarray:
+    doc, enc_path = args
+    enc = TextEncoder.load(path=enc_path)
+    eot = enc.special_tokens['<|endofdoc|>']
+    tokens = [eot]
+    tokens.extend(enc.encode(doc.split("See also")[0]))
+    tokens_np = np.array(tokens)
+    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    tokens_np_uint16 = tokens_np.astype(np.uint16)
+    return tokens_np_uint16
+
+# tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
+def tokenize_and_write_shards(ds: list, shards_dir: str, shard_size: int = 1000, nprocs: int = 1, model_path: str = "models/124M") -> int:
+    os.makedirs(shards_dir, exist_ok=True)
+    shard_index = 0
+    current_shard = []
+    current_size = 0
+    total_tokens = 0
+    for i in range(0, len(ds), 100_000):
+        ds_chunk = ds[i:i+100_000]["text"]
+        with mp.Pool(nprocs) as pool:
+            ds_and_enc = [(doc, model_path) for doc in ds_chunk]
+            for tokens in tqdm(pool.imap(tokenize, ds_and_enc, chunksize=1)):
+                total_tokens += len(tokens)
+                for token in tokens:
+                    current_shard.append(token)
+                    current_size += 1
+                    if current_size >= shard_size:
+                        split = "val" if shard_index == 0 else "train"
+                        shard_path = os.path.join(shards_dir, f"{split}_{shard_index:06d}.npy")
+                        np.save(shard_path, current_shard)
+                        print(f"Saved {shard_path}")
+                        current_shard = []
+                        current_size = 0
+                        shard_index += 1
+            if current_shard:
+                split = "val" if shard_index == 0 else "train"
+                shard_path = os.path.join(shards_dir, f"{split}_{shard_index:06d}.npy")
+                np.save(shard_path, current_shard)
+                print(f"Saved {shard_path}")
+        return total_tokens
+
 @dataclass
 class TrainerParams:
     """
@@ -541,47 +586,109 @@ class TrainerParams:
     model: nn.Module
     train_data: DataLoader
     optimizer: torch.optim.Optimizer
+    min_learning_rate: float = 5e-5
+    max_learning_rate: float = 1e-3
+    warmup_steps: int = 30
+    max_steps: int = 1000
     gpu_id: int = 0
     save_every: int = 10
+    model_path: str = "models"
     loss_fn: nn.Module = field(default_factory=lambda: nn.CrossEntropyLoss())
+    device_type: str = "cuda"
+    gradient_accumulation_steps: int = 8
 
+def configure_adamw_optimizer(
+        model: torch.nn.Module, 
+        weight_decay: float, 
+        learning_rate: float,
+        betas: tuple,
+        eps: float, 
+        device_type: str
+    ):
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    use_fused = 'fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == "cuda"
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=eps, fused=use_fused)
+    return optimizer
 
 class Trainer:
     def __init__(self, params: TrainerParams) -> None:
+        self.params = params
         self.gpu_id = params.gpu_id
+        self.device_type = params.device_type
         self.model = params.model
         self.model = self.model.to(self.gpu_id)
+        self.model = torch.compile(self.model)
         self.train_data = params.train_data
         self.optimizer = params.optimizer
         self.loss_fn = params.loss_fn
         self.save_every = params.save_every
-
-    def _run_epoch(self, epoch):
-        b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data):,}")
-        for i, (source, targets) in enumerate(self.train_data):
-            source = source.to(self.gpu_id)
-            targets = targets.to(self.gpu_id)
-            self.optimizer.zero_grad()
-            output = self.model(source)
-            loss = self.loss_fn(output.view(-1, output.size(-1)), targets.view(-1))
-            loss.backward()
-            self.optimizer.step()
-            print(f"Step {i+1}/{len(self.train_data)} | Loss: {loss.item():.3f}")
-
+        self.train_losses = []
+        self.train_steps = []
+        torch.set_float32_matmul_precision("high")
+        
+        self.step = 0
+        
     def _save_checkpoint(self, epoch):
         ckp = self.model.state_dict()
-        PATH = "checkpoint.pt"
+        PATH = os.path.join(self.params.model_path, f"checkpoint_{epoch}.pt")
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
 
-    def train(self, max_epochs: int):
-        for epoch in range(max_epochs):
-            self._run_epoch(epoch)
-            if epoch % self.save_every == 0:
-                self._save_checkpoint(epoch)
-                
-                
+    def get_lr(self, step: int):
+        if step < self.params.warmup_steps:
+            return self.params.max_learning_rate * (step+1) / self.params.warmup_steps
+        if step > self.params.max_steps:
+            return self.params.min_learning_rate
+        decay_ratio = (step - self.params.warmup_steps) / (self.params.max_steps - self.params.warmup_steps)
+        assert 0.0 <= decay_ratio <= 1.0
+        coeff = 0.5 * (1.0 + torch.cos(torch.pi * torch.tensor(decay_ratio)))
+        return self.params.min_learning_rate + coeff * (self.params.max_learning_rate - self.params.min_learning_rate)
+    
+    def train(self, steps: int = 1):
+        b_sz = len(next(iter(self.train_data))[0])
+        print(f"[GPU{self.gpu_id}] | Batchsize: {b_sz} | Steps: {len(self.train_data):,}")
+        self.model.train()
+        superstep_loss = 0
+        for i, (source, targets) in enumerate(self.train_data):
+            t0 = time.time()
+            source = source.to(self.gpu_id)
+            targets = targets.to(self.gpu_id)
+            self.optimizer.zero_grad()
+            with torch.autocast(device_type=self.device_type, dtype=torch.bfloat16):
+                output = self.model(source)
+                loss = self.loss_fn(output.view(-1, output.size(-1)), targets.view(-1))
+            self.train_losses.append(loss.item())
+            self.train_steps.append(i+1)
+            loss = loss / self.params.gradient_accumulation_steps
+            loss.backward()
+            superstep_loss += loss.item()
+            if (i+1) % self.params.gradient_accumulation_steps == 0:
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                lr = self.get_lr(self.step)
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = lr
+                self.optimizer.step()
+                torch.cuda.synchronize()
+                t1 = time.time()
+                if (i+1) % 8 == 0:
+                    dt = (t1 - t0)
+                    tps = (b_sz * self.train_data.dataset.T * self.params.gradient_accumulation_steps) / dt
+                    print(f"Step {i+1}/{len(self.train_data)} | Loss: {superstep_loss:.3f} | Norm: {norm:.3f} | LR: {lr:.4e} | Tokens/s: {tps:.0f}")
+                superstep_loss = 0 
+                self.step += 1          
+            if (i+1) % self.save_every == 0:
+                self._save_checkpoint((i+1))
+            if (i+1) == steps:
+                break
+            
+        return self.model
+    
 class TinyLLMDataset(TorchDataset):
 
     def __init__(self, shards_path, T, split, total_tokens):
@@ -616,4 +723,3 @@ class TinyLLMDataset(TorchDataset):
         Y = buf[1:]
         self.tokens = self.tokens[self.T+1:] # move window
         return X, Y
-    
